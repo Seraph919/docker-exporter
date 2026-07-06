@@ -5,16 +5,82 @@ WEB_ROOT="/tmp/metrics_www"
 DATA_FILE="$WEB_ROOT/metrics.prom"
 NGINX_STATUS_URL="${NGINX_STATUS_URL:-http://nginx/nginx_status}"
 
+# =====================================================================
+# LOGGING
+# =====================================================================
+LOG_LEVEL="${LOG_LEVEL:-INFO}"
+LOG_FILE="$WEB_ROOT/exporter.log"
+LOG_MAX_BYTES=$((5 * 1024 * 1024))  # rotate at 5MB
+
+declare -A LOG_LEVELS=( [DEBUG]=0 [INFO]=1 [WARN]=2 [ERROR]=3 )
+
+log() {
+    local level="$1"; shift
+    local msg="$*"
+    local level_num="${LOG_LEVELS[$level]:-1}"
+    local threshold="${LOG_LEVELS[$LOG_LEVEL]:-1}"
+    [[ $level_num -lt $threshold ]] && return 0
+
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    local line="[$ts] [$level] $msg"
+
+    echo "$line" >&2
+
+    mkdir -p "$WEB_ROOT" 2>/dev/null
+    echo "$line" >> "$LOG_FILE" 2>/dev/null
+
+    # simple size-based rotation, keep one previous file
+    if [[ -f "$LOG_FILE" ]]; then
+        local size
+        size=$(stat -c%s "$LOG_FILE" 2>/dev/null || wc -c < "$LOG_FILE" 2>/dev/null)
+        if [[ -n "$size" && "$size" -gt "$LOG_MAX_BYTES" ]]; then
+            mv "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null
+        fi
+    fi
+}
+
+# time a command, logging start/end/duration/status at DEBUG,
+# and an ERROR line if it failed. Usage: time_stage "label" cmd args...
+time_stage() {
+    local label="$1"; shift
+    local start end dur status
+    start=$(date +%s.%N)
+    "$@"
+    status=$?
+    end=$(date +%s.%N)
+    dur=$(awk -v a="$start" -v b="$end" 'BEGIN{printf "%.2f", b-a}')
+    if [[ $status -ne 0 ]]; then
+        log ERROR "$label failed (exit=$status, took ${dur}s)"
+    else
+        log DEBUG "$label ok (took ${dur}s)"
+    fi
+    return $status
+}
+
+log INFO "Exporter starting (PID $$, LOG_LEVEL=$LOG_LEVEL, PORT=$PORT)"
+
+# Postgres connection: PGHOST, PGPORT, PGUSER, PGDATABASE, PGPASSWORD are all
+# standard libpq env vars — psql reads them automatically, so just set them
+# in the container's env_file (docker-compose) and nothing else is needed here.
+
 mkdir -p "$WEB_ROOT"
 
 collect_data() {
+    local cycle=0
     while true; do
+        cycle=$((cycle + 1))
+        local cycle_start
+        cycle_start=$(date +%s.%N)
+        log DEBUG "=== Collection cycle $cycle starting ==="
+
         TMP_FILE="/tmp/stats_new.prom"
         > "$TMP_FILE"
 
         # =====================================================================
         # 1. HOST HARDWARE METRICS (NATIVE BASH)
         # =====================================================================
+        log DEBUG "Collecting host hardware metrics"
 
         # 1a. System Uptime
         if [[ -f /proc/uptime ]]; then
@@ -220,7 +286,11 @@ collect_data() {
         # =====================================================================
         # 2. NGINX STUB_STATUS METRICS
         # =====================================================================
+        log DEBUG "Fetching nginx stub_status from $NGINX_STATUS_URL"
         nginx_body=$(curl -sf --max-time 2 "$NGINX_STATUS_URL" 2>/dev/null)
+        if [[ -z "$nginx_body" ]]; then
+            log WARN "nginx stub_status unreachable at $NGINX_STATUS_URL (skipping nginx metrics this cycle)"
+        fi
         if [[ -n "$nginx_body" ]]; then
             nginx_active=$(echo "$nginx_body"  | awk '/^Active connections:/ {print $3}')
             nginx_accepts=$(echo "$nginx_body" | awk 'NR==3 {print $1}')
@@ -268,17 +338,176 @@ EOF
         fi
 
         # =====================================================================
-        # 3. DOCKER CONTAINER METRICS
+        # 3. POSTGRESQL METRICS
+        #
+        # Uses `psql -tAF $'\t'` (tuples only, unaligned, tab-separated) so
+        # output can be read straight into bash `read` without extra parsing.
+        # Every query is guarded by checking psql's exit status, so if
+        # Postgres is briefly unreachable this section is just skipped
+        # rather than emitting empty/garbage samples.
+        # =====================================================================
+
+        TAB=$'\t'
+        PSQL=(psql -tAX -F "$TAB" -v ON_ERROR_STOP=1)
+
+        log DEBUG "Querying Postgres at ${PGHOST:-unset}:${PGPORT:-unset}/${PGDATABASE:-unset} as ${PGUSER:-unset}"
+
+        # 3a. Connections in use vs max_connections (the #1 "why did prod fall over" metric)
+        pg_conn_out=$("${PSQL[@]}" -c "
+            SELECT
+                (SELECT count(*) FROM pg_stat_activity),
+                (SELECT setting::int FROM pg_settings WHERE name = 'max_connections'),
+                (SELECT count(*) FROM pg_stat_activity WHERE state = 'active'),
+                (SELECT count(*) FROM pg_stat_activity WHERE state = 'idle in transaction')
+        " 2>/tmp/pg_err.log)
+        pg_status=$?
+        if [[ $pg_status -ne 0 ]]; then
+            log ERROR "Postgres connection/query failed (exit=$pg_status): $(tr '\n' ' ' < /tmp/pg_err.log)"
+        fi
+        if [[ $pg_status -eq 0 && -n "$pg_conn_out" ]]; then
+            log DEBUG "Postgres reachable, collecting database metrics"
+            IFS=$'\t' read -r pg_conns pg_max_conns pg_active pg_idle_in_txn <<< "$pg_conn_out"
+            echo "# HELP pg_connections_used Current number of connections to the database." >> "$TMP_FILE"
+            echo "# TYPE pg_connections_used gauge" >> "$TMP_FILE"
+            echo "pg_connections_used $pg_conns" >> "$TMP_FILE"
+            echo "# HELP pg_connections_max Configured max_connections." >> "$TMP_FILE"
+            echo "# TYPE pg_connections_max gauge" >> "$TMP_FILE"
+            echo "pg_connections_max $pg_max_conns" >> "$TMP_FILE"
+            echo "# HELP pg_connections_active Connections currently executing a query." >> "$TMP_FILE"
+            echo "# TYPE pg_connections_active gauge" >> "$TMP_FILE"
+            echo "pg_connections_active $pg_active" >> "$TMP_FILE"
+            echo "# HELP pg_connections_idle_in_transaction Connections idle inside an open transaction (leak indicator)." >> "$TMP_FILE"
+            echo "# TYPE pg_connections_idle_in_transaction gauge" >> "$TMP_FILE"
+            echo "pg_connections_idle_in_transaction $pg_idle_in_txn" >> "$TMP_FILE"
+
+            if [[ "$pg_max_conns" -gt 0 ]]; then
+                conn_pct=$(awk -v u="$pg_conns" -v m="$pg_max_conns" 'BEGIN{printf "%.0f", (u/m)*100}')
+                if [[ "$conn_pct" -ge 80 ]]; then
+                    log WARN "Postgres connections at ${conn_pct}% of max_connections ($pg_conns/$pg_max_conns)"
+                fi
+            fi
+            if [[ "$pg_idle_in_txn" -ge 5 ]]; then
+                log WARN "Postgres has $pg_idle_in_txn connections idle-in-transaction (possible leak)"
+            fi
+
+            # 3b. Per-database size, transactions, cache hit ratio, deadlocks, temp files
+            echo "# HELP pg_database_size_bytes Size of each database on disk." >> "$TMP_FILE"
+            echo "# TYPE pg_database_size_bytes gauge" >> "$TMP_FILE"
+            echo "# HELP pg_xact_commit_total Committed transactions per database." >> "$TMP_FILE"
+            echo "# TYPE pg_xact_commit_total counter" >> "$TMP_FILE"
+            echo "# HELP pg_xact_rollback_total Rolled-back transactions per database." >> "$TMP_FILE"
+            echo "# TYPE pg_xact_rollback_total counter" >> "$TMP_FILE"
+            echo "# HELP pg_cache_hit_ratio Fraction of reads served from shared_buffers (0-1). Low values mean shared_buffers is too small." >> "$TMP_FILE"
+            echo "# TYPE pg_cache_hit_ratio gauge" >> "$TMP_FILE"
+            echo "# HELP pg_deadlocks_total Deadlocks detected per database." >> "$TMP_FILE"
+            echo "# TYPE pg_deadlocks_total counter" >> "$TMP_FILE"
+            echo "# HELP pg_temp_files_total Temp files created per database (query spilling to disk)." >> "$TMP_FILE"
+            echo "# TYPE pg_temp_files_total counter" >> "$TMP_FILE"
+            echo "# HELP pg_temp_bytes_total Temp file bytes written per database." >> "$TMP_FILE"
+            echo "# TYPE pg_temp_bytes_total counter" >> "$TMP_FILE"
+
+            "${PSQL[@]}" -c "
+                SELECT
+                    datname,
+                    pg_database_size(datname),
+                    xact_commit,
+                    xact_rollback,
+                    CASE WHEN (blks_hit + blks_read) = 0 THEN 1
+                         ELSE round(blks_hit::numeric / (blks_hit + blks_read), 4)
+                    END,
+                    deadlocks,
+                    temp_files,
+                    temp_bytes
+                FROM pg_stat_database
+                WHERE datname NOT IN ('template0', 'template1')
+            " 2>/dev/null | while IFS=$'\t' read -r dbname dbsize commits rollbacks hitratio deadlocks tempfiles tempbytes; do
+                [[ -z "$dbname" ]] && continue
+                dbname_label="${dbname//\"/\\\"}"
+                echo "pg_database_size_bytes{database=\"$dbname_label\"} $dbsize"     >> "$TMP_FILE"
+                echo "pg_xact_commit_total{database=\"$dbname_label\"} $commits"      >> "$TMP_FILE"
+                echo "pg_xact_rollback_total{database=\"$dbname_label\"} $rollbacks"  >> "$TMP_FILE"
+                echo "pg_cache_hit_ratio{database=\"$dbname_label\"} $hitratio"       >> "$TMP_FILE"
+                echo "pg_deadlocks_total{database=\"$dbname_label\"} $deadlocks"      >> "$TMP_FILE"
+                echo "pg_temp_files_total{database=\"$dbname_label\"} $tempfiles"     >> "$TMP_FILE"
+                echo "pg_temp_bytes_total{database=\"$dbname_label\"} $tempbytes"     >> "$TMP_FILE"
+            done
+
+            # 3c. Table bloat indicator: dead tuples per table (top offenders only, capped at 20)
+            echo "# HELP pg_table_dead_tuples Estimated dead (unvacuumed) tuples per table." >> "$TMP_FILE"
+            echo "# TYPE pg_table_dead_tuples gauge" >> "$TMP_FILE"
+            echo "# HELP pg_table_seconds_since_vacuum Seconds since last autovacuum ran on the table." >> "$TMP_FILE"
+            echo "# TYPE pg_table_seconds_since_vacuum gauge" >> "$TMP_FILE"
+
+            "${PSQL[@]}" -c "
+                SELECT
+                    schemaname || '.' || relname,
+                    n_dead_tup,
+                    COALESCE(EXTRACT(EPOCH FROM (now() - GREATEST(last_vacuum, last_autovacuum)))::bigint, -1)
+                FROM pg_stat_user_tables
+                ORDER BY n_dead_tup DESC
+                LIMIT 20
+            " 2>/dev/null | while IFS=$'\t' read -r tablename deadtup vacuumage; do
+                [[ -z "$tablename" ]] && continue
+                table_label="${tablename//\"/\\\"}"
+                echo "pg_table_dead_tuples{table=\"$table_label\"} $deadtup"              >> "$TMP_FILE"
+                echo "pg_table_seconds_since_vacuum{table=\"$table_label\"} $vacuumage"    >> "$TMP_FILE"
+            done
+
+            # 3d. Replication lag (only emits rows if this instance has replicas/standbys)
+            pg_repl_out=$("${PSQL[@]}" -c "
+                SELECT application_name,
+                       COALESCE(EXTRACT(EPOCH FROM replay_lag)::numeric, 0)
+                FROM pg_stat_replication
+            " 2>/dev/null)
+            if [[ $? -eq 0 && -n "$pg_repl_out" ]]; then
+                echo "# HELP pg_replication_lag_seconds Replication lag to each connected standby." >> "$TMP_FILE"
+                echo "# TYPE pg_replication_lag_seconds gauge" >> "$TMP_FILE"
+                echo "$pg_repl_out" | while IFS=$'\t' read -r appname lagsec; do
+                    [[ -z "$appname" ]] && continue
+                    app_label="${appname//\"/\\\"}"
+                    echo "pg_replication_lag_seconds{standby=\"$app_label\"} $lagsec" >> "$TMP_FILE"
+                done
+            fi
+
+            # 3e. Locks currently held/waited on (blocking query indicator)
+            pg_locks_out=$("${PSQL[@]}" -c "
+                SELECT count(*) FILTER (WHERE granted),
+                       count(*) FILTER (WHERE NOT granted)
+                FROM pg_locks
+            " 2>/dev/null)
+            if [[ $? -eq 0 && -n "$pg_locks_out" ]]; then
+                IFS=$'\t' read -r pg_locks_granted pg_locks_waiting <<< "$pg_locks_out"
+                echo "# HELP pg_locks_granted Locks currently granted." >> "$TMP_FILE"
+                echo "# TYPE pg_locks_granted gauge" >> "$TMP_FILE"
+                echo "pg_locks_granted $pg_locks_granted" >> "$TMP_FILE"
+                echo "# HELP pg_locks_waiting Locks currently waiting to be granted (contention indicator)." >> "$TMP_FILE"
+                echo "# TYPE pg_locks_waiting gauge" >> "$TMP_FILE"
+                echo "pg_locks_waiting $pg_locks_waiting" >> "$TMP_FILE"
+            fi
+        fi
+
+        # =====================================================================
+        # 4. DOCKER CONTAINER METRICS
         # =====================================================================
         curl -s --unix-socket "$SOCKET" http://localhost/containers/json | \
             jq -r '.[] | [.Id, (.Names[0] | ltrimstr("/")), .Image, (.Id[:12])] | @tsv' \
             > /tmp/ids.tmp 2>/dev/null
 
+        container_count=$(wc -l < /tmp/ids.tmp 2>/dev/null || echo 0)
+        if [[ "$container_count" -eq 0 ]]; then
+            log WARN "No containers found via Docker socket at $SOCKET (is it mounted/reachable?)"
+        else
+            log DEBUG "Found $container_count containers to scrape"
+        fi
+
         while IFS=$'\t' read -r clean_id name image short_id || [[ -n "$clean_id" ]]; do
             [[ -z "$clean_id" ]] && continue
-            curl -s --unix-socket "$SOCKET" \
-                "http://localhost/containers/${clean_id}/stats?stream=false" | \
-            jq -r --arg id "$clean_id" --arg name "$name" --arg image "$image" --arg short_id "$short_id" '
+            stats_json=$(curl -s --unix-socket "$SOCKET" \
+                "http://localhost/containers/${clean_id}/stats?stream=false")
+            if [[ -z "$stats_json" ]]; then
+                log WARN "No stats returned for container $name ($short_id)"
+            fi
+            echo "$stats_json" | jq -r --arg id "$clean_id" --arg name "$name" --arg image "$image" --arg short_id "$short_id" '
                 def labels: "{container=\"" + $name + "\",id=\"" + $id + "\",image=\"" + $image + "\"}";
                 "container_memory_usage_bytes"              + labels + " " + (.memory_stats.usage // 0 | tostring),
                 "container_memory_limit_bytes"             + labels + " " + (.memory_stats.limit // 0 | tostring),
@@ -291,7 +520,7 @@ EOF
                 )
             ' >> "$TMP_FILE" 2>/dev/null
 
-            # 3a. Container restart count + OOM killed flag
+            # 4a. Container restart count + OOM killed flag
             curl -s --unix-socket "$SOCKET" \
                 "http://localhost/containers/${clean_id}/json" | \
             jq -r --arg name "$name" --arg image "$image" --arg id "$clean_id" '
@@ -319,41 +548,30 @@ EOF
         cp "$TMP_FILE" "$WEB_ROOT/.metrics.tmp"
         mv "$WEB_ROOT/.metrics.tmp" "$DATA_FILE"
 
+        cycle_end=$(date +%s.%N)
+        cycle_dur=$(awk -v a="$cycle_start" -v b="$cycle_end" 'BEGIN{printf "%.2f", b-a}')
+        metric_lines=$(grep -vc '^#' "$DATA_FILE" 2>/dev/null || echo 0)
+        log INFO "Cycle $cycle complete: ${metric_lines} metric lines written in ${cycle_dur}s"
+
         sleep 5
     done
 }
-
-# =====================================================================
-# HTTP SERVER — busybox httpd instead of a hand-rolled `nc -l` loop.
-#
-# Why this fixes the data race:
-#   `nc -l -p PORT` only binds, accepts ONE connection, then exits.
-#   Looping it means there's a window after one `nc` exits and before
-#   the next one re-binds the port where the socket isn't listening at
-#   all (connection refused), and under concurrent scrapers two loop
-#   iterations can race to bind the same port. There's no concurrency
-#   control and no keep-alive support either.
-#
-#   busybox httpd is a proper forking HTTP daemon: it binds the port
-#   once, stays listening, and handles each request in its own
-#   connection without racing itself. Since we just want to serve a
-#   single static file (Prometheus text-format metrics), we point it
-#   at $WEB_ROOT and let it serve $DATA_FILE as a normal static GET.
-# =====================================================================
 
 serve() {
     cat > "$WEB_ROOT/httpd.conf" <<'EOF'
 .prom:text/plain
 EOF
+    log INFO "Starting busybox httpd on port $PORT, serving $WEB_ROOT (target: $DATA_FILE)"
     exec httpd -f -p "$PORT" -h "$WEB_ROOT" -c "$WEB_ROOT/httpd.conf"
 }
 
 collect_data &
 COLLECTOR_PID=$!
-trap "kill $COLLECTOR_PID 2>/dev/null; exit" SIGINT SIGTERM
+trap "log INFO 'Received shutdown signal, stopping collector (PID $COLLECTOR_PID)'; kill $COLLECTOR_PID 2>/dev/null; exit" SIGINT SIGTERM
 
-echo "Waiting for initial data collection..."
+log INFO "Waiting for initial data collection..."
 sleep 6
-echo "Metrics server running on port $PORT (busybox httpd, serving $DATA_FILE)"
-echo "Scrape target should be configured as: http://<host>:$PORT/metrics.prom"
+log INFO "Metrics server running on port $PORT (busybox httpd, serving $DATA_FILE)"
+log INFO "Scrape target should be configured as: http://<host>:$PORT/metrics.prom"
+log INFO "Logs: stderr (docker logs) and $LOG_FILE"
 serve
