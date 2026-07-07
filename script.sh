@@ -339,12 +339,6 @@ EOF
 
         # =====================================================================
         # 3. POSTGRESQL METRICS
-        #
-        # Uses `psql -tAF $'\t'` (tuples only, unaligned, tab-separated) so
-        # output can be read straight into bash `read` without extra parsing.
-        # Every query is guarded by checking psql's exit status, so if
-        # Postgres is briefly unreachable this section is just skipped
-        # rather than emitting empty/garbage samples.
         # =====================================================================
 
         TAB=$'\t'
